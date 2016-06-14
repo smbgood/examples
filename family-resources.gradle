@@ -1,0 +1,230 @@
+import groovy.io.FileType
+
+android.sourceSets.each { sourceSet ->
+    String name = sourceSet.name
+    if(name.startsWith('android') || name.startsWith('test') || name.startsWith('beta') || name.startsWith('debug') || name.startsWith('release'))
+        return
+
+    def appFamily = ''
+
+    sourceSet.res.srcDirs.each { srcDir ->
+        appFamily = getAppFamilyForFlavor(srcDir.path + "/values/ids.xml")
+        appFamily = appFamily.substring(0, 2)
+    }
+    if(!appFamily.isEmpty()){
+        ArrayList<FileInfo> familyList = gatherFamilyAssets(appFamily)
+        ArrayList<XmlResourceInfo> familyValues = getFamilyXmlValues(appFamily)
+        sourceSet.res.srcDirs.each { srcDir ->
+            familyList = checkAssetOverrides(srcDir.path, familyList)
+            familyValues = checkXmlOverrides(srcDir.path, familyValues)
+        }
+
+        createFileTree("shared/$appFamily/assembled/$name/res", familyList)
+
+        createXmlFromInfo("shared/$appFamily/assembled/$name/res/values", familyValues, appFamily.toLowerCase() + '-' + name)
+
+        sourceSet.res.srcDirs += ["shared/$appFamily/assembled/$name/res"]
+    }
+}
+
+def ArrayList<FileInfo> gatherFamilyAssets(String familyCode){
+    def ArrayList<FileInfo> outList = new ArrayList<>();
+    def dir = new File("shared/" + familyCode + "/res")
+    dir.eachFile (FileType.DIRECTORIES) { directory ->
+        if (!directory.name.contains('values')) {
+            ArrayList<File> filesList = new ArrayList<>();
+            directory.eachFile(FileType.FILES) { eachFile ->
+                filesList.add(eachFile)
+            }
+            FileInfo resourceDir = new FileInfo(directory.name, directory.path, filesList);
+            outList.add(resourceDir);
+        }
+    }
+    return outList;
+}
+
+import groovy.util.slurpersupport.GPathResult
+
+def HashMap<String, String> parseXmlToMap(File file, XmlSlurper xmlSlurper) {
+    def HashMap<String, String> outMap = new HashMap<>();
+    def resources = xmlSlurper.parse(file)
+    if(file.path.contains("color.xml")){
+        resources.color.each{ GPathResult element ->
+            String text = element.text() as String
+            String key = element.@name as String
+            outMap.put(key, text)
+        }
+    }else {
+        resources.string.each{ GPathResult element ->
+            String text = element.text() as String
+            String key = element.@name as String
+            outMap.put(key, text)
+        }
+    }
+    return outMap
+}
+
+def ArrayList<XmlResourceInfo> getFamilyXmlValues(String familyCode){
+    def ArrayList<XmlResourceInfo> outList = new ArrayList<>();
+    def dir = new File("shared/" + familyCode + "/res/values")
+    XmlSlurper xs = new XmlSlurper()
+    dir.eachFile(FileType.FILES){ File file ->
+        outList.add(new XmlResourceInfo(file.name.toString(), file.path.toString(), (HashMap<String, String>) parseXmlToMap(file, xs)))
+    }
+    return outList;
+}
+
+def String getAppFamilyForFlavor(String path){
+    def idsFile = new File(path)
+    XmlSlurper slurper = new XmlSlurper()
+    def HashMap<String, String> flavorMap = (HashMap<String, String>) parseXmlToMap(idsFile, slurper)
+    if(flavorMap.containsKey('family')){
+        return flavorMap.get('family')
+    }
+    return 'NA'
+}
+
+def ArrayList<XmlResourceInfo> checkXmlOverrides(String path, ArrayList<XmlResourceInfo> values){
+    def root = new File(path)
+    root.eachFile(FileType.DIRECTORIES) { valueDirectory ->
+        if(valueDirectory.path.contains("values")) {
+            XmlSlurper slurper = new XmlSlurper();
+            valueDirectory.eachFile(FileType.FILES) { file ->
+                XmlResourceInfo current
+                int index = -1
+                for (XmlResourceInfo info : values) {
+                    if (file.name.equals(info.fileName)) {
+                        current = info;
+                        index = values.indexOf(info)
+                        break
+                    }
+                }
+                //compare flavor values set against current values set, removing any from current that are in flavor
+                if (current != null) {
+                    def HashMap<String, String> flavorMap = (HashMap<String, String>) parseXmlToMap(file, slurper)
+                    def ArrayList<String> toRemove = new ArrayList<>()
+                    for (String key : flavorMap.keySet()) {
+                        if (current.values.containsKey(key)) {
+                            toRemove.add(key)
+                        }
+                    }
+                    for (String keyToRemove : toRemove) {
+                        current.values.remove(keyToRemove)
+                    }
+                    values.set(index, current)
+                }
+            }
+        }
+    }
+    return values
+}
+
+def ArrayList<FileInfo> checkAssetOverrides(String path, ArrayList<FileInfo> list){
+    def dire = new File(path)
+    dire.eachFile(FileType.DIRECTORIES) { rootDirectory ->
+        if(!rootDirectory.path.contains("values")) {
+            FileInfo current
+            int index = -1
+            for (FileInfo info : list) {
+                if (info.name.equals(rootDirectory.name)) {
+                    current = info;
+                    index = list.indexOf(info)
+                    break
+                }
+            }
+            if (current != null) {
+                rootDirectory.eachFile(FileType.FILES) { file ->
+                    def toRemove = null
+                    for (File f : current.files) {
+                        if (f.name.equals(file.name)) {
+                            toRemove = f
+                            break
+                        }
+                    }
+                    if (toRemove != null) {
+                        current.files.remove(toRemove)
+                    }
+                    if (index > -1) {
+                        list.set(index, current)
+                    }
+                }
+            }
+        }
+    }
+    return list;
+}
+import groovy.xml.StreamingMarkupBuilder;
+
+def createXmlFromInfo(String path, ArrayList<XmlResourceInfo> xmlInfos, String namePart){
+    def valuesDir = new File(path)
+    if(valuesDir.exists())
+        valuesDir.deleteDir()
+    valuesDir.mkdirs()
+
+    for(XmlResourceInfo info : xmlInfos){
+        def dotIndex = info.fileName.indexOf('.')
+        String uniqueFilename = info.fileName.substring(0, dotIndex) + '-' + namePart + info.fileName.substring(dotIndex, info.fileName.length())
+        File output = new File(path + "/" + uniqueFilename)
+        new StreamingMarkupBuilder().bind{ builder->
+            mkp.xmlDeclaration(["version" : "1.0", "encoding": "UTF-8"])
+            resources{
+                buildValues builder, info.values, info.fileName
+            }
+        }.writeTo(output.newWriter("UTF-8"))
+    }
+}
+
+def buildValues(builder, HashMap<String, String> values, filename){
+    if(filename.contains("color")){
+        for (String s : values.keySet()) {
+            builder.color(name:s, values.get(s))
+        }
+    }else {
+        for (String s : values.keySet()) {
+            builder.string(name: s, values.get(s))
+        }
+    }
+}
+
+def createFileTree(String s, ArrayList<FileInfo> fileInfos) {
+    def assembledResDir = new File(s);
+
+    if(assembledResDir.exists()){
+        assembledResDir.deleteDir();
+    }
+    assembledResDir.mkdirs();
+
+    final FileTreeBuilder treeBuilder = new FileTreeBuilder(assembledResDir)
+
+    for(FileInfo fileInfo : fileInfos){
+        treeBuilder.dir(fileInfo.name){
+            for(File aFile : fileInfo.files){
+                file(aFile.name, aFile)
+            }
+        }
+    }
+}
+
+public class FileInfo{
+    public String name;
+    public String path;
+    public ArrayList<File> files;
+
+    FileInfo(String name, String path, ArrayList<File> files) {
+        this.name = name
+        this.path = path
+        this.files = files
+    }
+}
+
+def class XmlResourceInfo{
+    public String fileName
+    public String path
+    public HashMap<String, String> values
+
+    XmlResourceInfo(String fileName, String path, HashMap<String, String> values) {
+        this.fileName = fileName
+        this.path = path
+        this.values = values
+    }
+}
